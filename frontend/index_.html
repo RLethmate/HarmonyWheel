@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Chord Detector</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0b12;color:#eaeaf0}
+    .card{width:min(720px,92vw);background:#141425;border:1px solid #2a2a46;border-radius:16px;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+    button{background:#2b6cff;border:none;color:white;padding:10px 14px;border-radius:10px;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .big{font-size:64px;font-weight:900;letter-spacing:.5px;margin:14px 0}
+    .muted{color:#a7a7c7}
+    .pill{display:inline-flex;gap:8px;align-items:center;background:#1b1b33;border:1px solid #2a2a46;border-radius:999px;padding:6px 10px}
+    .dot{width:10px;height:10px;border-radius:999px;background:#444}
+    .dot.on{background:#31d67b;box-shadow:0 0 14px rgba(49,214,123,.8)}
+    code{background:#101022;padding:2px 6px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:800">🎸 Live Chord Detector</div>
+        <div class="muted">WebSocket → FastAPI /ws • sendet Float32 @ 16 kHz</div>
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <span class="pill"><span id="sig" class="dot"></span><span class="muted">Signal</span></span>
+        <button id="btn">Start</button>
+      </div>
+    </div>
+
+    <div id="chord" class="big">--</div>
+
+    <div class="row" style="margin:10px 0 6px 0">
+      <div class="pill">
+        <span class="muted">Engine</span>
+        <select id="engine" style="background:#101022;color:#eaeaf0;border:1px solid #2a2a46;border-radius:10px;padding:6px 10px">
+          <option value="dsp">DSP</option>
+          <option value="crema" selected>Crema</option>
+        </select>
+      </div>
+
+      <div class="pill">
+        <span class="muted">Style</span>
+        <select id="mode" style="background:#101022;color:#eaeaf0;border:1px solid #2a2a46;border-radius:10px;padding:6px 10px">
+          <option value="pop" selected>Pop</option>
+          <option value="jazz">Jazz</option>
+        </select>
+      </div>
+
+      <div class="pill" style="gap:10px">
+        <span class="muted">Gate</span>
+        <input id="gate" type="range" min="0" max="0.08" step="0.001" value="0.010" style="width:200px" />
+        <strong id="gateVal">0.010</strong>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="pill"><span class="muted">Confidence</span><strong id="conf">--</strong></div>
+      <div class="pill"><span class="muted">Key</span><strong id="key">--</strong></div>
+      <div class="pill"><span class="muted">Server</span><code id="srv">ws://127.0.0.1:8001/ws</code></div>
+    </div>
+
+    <p class="muted" style="margin-top:14px">
+      Hinweis: Öffne diese Seite über einen lokalen HTTP-Server (nicht per file://), z.B.
+      <code>python -m http.server 5173</code> im Ordner <code>frontend/</code>.
+    </p>
+  </div>
+
+<script>
+    // Backend WebSocket URL (wichtig!)
+window.LIVE_WS_URL = "ws://127.0.0.1:8002/ws";
+const SR_TARGET = 16000;
+// Default: run the toggle-able backend on 8002
+const WS_PORT = 8002;
+const WS_URL = `ws://${location.hostname}:${WS_PORT}/ws`;
+
+const elChord = document.getElementById('chord');
+const elConf = document.getElementById('conf');
+const elKey = document.getElementById('key');
+const elBtn = document.getElementById('btn');
+const elEngine = document.getElementById('engine');
+const elMode = document.getElementById('mode');
+const elGate = document.getElementById('gate');
+const elGateVal = document.getElementById('gateVal');
+const elSig = document.getElementById('sig');
+const elSrv = document.getElementById('srv');
+elSrv.textContent = WS_URL;
+
+let ctx, ws, proc, src;
+let running = false;
+
+let engine = 'crema';         // 'dsp' | 'crema'
+let mode = 'pop';           // 'pop' | 'jazz'
+let gate = 0.010;            // RMS threshold (0..~0.08 typical)
+
+function sendConfig(){
+  if(!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({type:'config', engine, mode, gate, debug:true, debug_every:1}));
+
+}
+
+function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
+// UI wiring
+elEngine.onchange = () => { engine = elEngine.value; sendConfig(); };
+elMode.onchange = () => { mode = elMode.value; sendConfig(); };
+elGate.oninput = () => {
+  gate = clamp(parseFloat(elGate.value), 0, 0.2);
+  elGateVal.textContent = gate.toFixed(3);
+  sendConfig();
+};
+
+// init UI
+elGateVal.textContent = gate.toFixed(3);
+elMode.value = mode;
+elEngine.value = engine;
+
+function rms(buf){
+  let s=0;
+  for(let i=0;i<buf.length;i++) s += buf[i]*buf[i];
+  return Math.sqrt(s/buf.length);
+}
+
+function resampleTo16k(input, inSR){
+  if(inSR === SR_TARGET) return input;
+  const ratio = inSR / SR_TARGET;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for(let i=0;i<outLen;i++){
+    const t = i * ratio;
+    const i0 = Math.floor(t);
+    const i1 = Math.min(input.length-1, i0+1);
+    const frac = t - i0;
+    out[i] = input[i0]*(1-frac) + input[i1]*frac;
+  }
+  return out;
+}
+
+async function start(){
+  elBtn.disabled = true;
+  elBtn.textContent = 'Starting…';
+
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onmessage = (ev) => {
+    try{
+      const msg = JSON.parse(ev.data);
+      if(msg.chord){
+        elChord.textContent = msg.chord;
+        elConf.textContent = (msg.confidence ?? 0).toFixed(2);
+      }else{
+        elChord.textContent = '--';
+        elConf.textContent = '0.00';
+      }
+      // Top-2 key display (new backend)
+      if(msg.key && msg.key.top1){
+        const k1 = msg.key.top1;
+        const k2 = msg.key.top2;
+        const s1 = `${k1.tonic} ${k1.mode} (${(k1.confidence ?? 0).toFixed(2)})`;
+        const s2 = k2 ? ` • ${k2.tonic} ${k2.mode} (${(k2.confidence ?? 0).toFixed(2)})` : '';
+        elKey.textContent = s1 + s2;
+      } else {
+        elKey.textContent = '--';
+      }
+    }catch(e){/* ignore */}
+  };
+
+  // If backend dies / socket closes, don't leave UI in a "stuck" state
+  ws.onclose = () => stop();
+  ws.onerror = () => stop();
+
+  await new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = reject;
+  });
+
+  // Send initial config
+  sendConfig();
+
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  src = ctx.createMediaStreamSource(stream);
+
+  // ScriptProcessor is deprecated but widely supported and simplest for a starter.
+  // We can migrate to AudioWorklet later.
+  const bufSize = 4096;
+  proc = ctx.createScriptProcessor(bufSize, 1, 1);
+
+  proc.onaudioprocess = (e) => {
+    if(!running) return;
+    const input = e.inputBuffer.getChannelData(0);
+
+    // signal LED
+    const r = rms(input);
+    elSig.classList.toggle('on', r > gate);
+
+    // resample and send
+    const out = resampleTo16k(input, ctx.sampleRate);
+    if(ws && ws.readyState === WebSocket.OPEN){
+      // Backpressure: if send buffer is large, drop this frame.
+      if(ws.bufferedAmount < 1_000_000){
+        // Optional client-side gate: don't stream silence constantly
+        // (backend has its own gate as well)
+        if(r >= gate * 0.7){
+          ws.send(out.buffer);
+        }
+      }
+    }
+  };
+
+  // Connect graph
+  src.connect(proc);
+  proc.connect(ctx.destination);
+
+  running = true;
+  elBtn.textContent = 'Stop';
+  elBtn.disabled = false;
+}
+
+function stop(){
+  running = false;
+  try{ proc && proc.disconnect(); }catch(e){}
+  try{ src && src.disconnect(); }catch(e){}
+  try{ ctx && ctx.close(); }catch(e){}
+  try{ ws && ws.close(); }catch(e){}
+  elSig.classList.remove('on');
+  elBtn.textContent = 'Start';
+}
+
+elBtn.onclick = async () => {
+  if(!running){
+    try{ await start(); }catch(e){
+      console.error(e);
+      alert('Start fehlgeschlagen: ' + (e?.message || e));
+      stop();
+    }
+  } else {
+    stop();
+  }
+};
+</script>
+</body>
+</html>
