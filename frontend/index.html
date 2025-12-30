@@ -1108,19 +1108,23 @@
 
         let currentVizNotes = [];
            
-        function playChordFromPosition(posData) {
-            initAudio(); 
+        function playChordFromPosition(posData, playAudio = true) { // <--- WICHTIG: 2. Parameter
+            // Audio nur starten, wenn playAudio wahr ist
+            if (playAudio) initAudio(); 
+            
             const isJazz = jazzToggle.checked; 
             const isGuitar = guitarToggle.checked; 
             const isMinor = tonalityToggle.checked;
             const modeData = isMinor ? posData.minor : posData.major;
             
+            // Info Bar Update
             const infoBar = document.getElementById('infoBar');
             if(infoBar) infoBar.innerHTML = `<div class="info-title" style="color:${modeData.color}">${modeData.roman}</div><div class="info-desc">${modeData.desc}</div>`;
 
             lastClickedRoman = modeData.roman;
             redrawLines(); 
 
+            // --- GRUNDTON BESTIMMEN ---
             let indexAtTop = safeMod(0 - currentStep, 12);
             const keyCenterName = notes[indexAtTop]; 
             
@@ -1141,12 +1145,13 @@
             currentChordLabelForVisualizer = `${absRootName}|${displayLabel}`;
             currentRootNoteName = absRootName;
 
-            const now = audioCtx.currentTime;
+            const now = audioCtx ? audioCtx.currentTime : 0;
             const playedNotesInfo = [];
-            currentVizNotes = []; // Reset wichtig!
+            currentVizNotes = []; 
 
+            // --- AUDIO & BERECHNUNG ---
             if (isGuitar) {
-                // --- GITARREN LOGIK ---
+                // ... Gitarren Key Lookup Logik (wie gehabt) ...
                 let libSuffix = "";
                 if (chordLabelSuffix === "Dur") libSuffix = ""; 
                 else if (chordLabelSuffix === "Moll") libSuffix = "m"; 
@@ -1158,17 +1163,14 @@
                 let pattern = guitarChordLibrary[lookupKey];
                 
                 if (!pattern && enharmonicMap[absRootName]) {
-                    let altRoot = enharmonicMap[absRootName];
-                    let altKey = (altRoot + libSuffix).replace(" ", "");
+                    let altKey = (enharmonicMap[absRootName] + libSuffix).replace(" ", "");
                     pattern = guitarChordLibrary[altKey];
                 }
                 if (!pattern && absRootName === "H") pattern = guitarChordLibrary["B" + libSuffix];
-                
                 if (!pattern) {
                     if (libSuffix === "m7b5") pattern = guitarChordLibrary[absRootName+"m"];
                     else pattern = guitarChordLibrary[absRootName];
                 }
-                
                 if (!pattern) pattern = [-1,-1,-1,-1,-1,-1];
 
                 const openStringMidis = [40, 45, 50, 55, 59, 64];
@@ -1180,18 +1182,18 @@
                         const noteName = notes[midiPitch % 12];
                         const octave = Math.floor(midiPitch / 12) - 1;
 
-                        playTone(freq, 'guitar', now + (stringIndex * 0.04));
+                        // <--- HIER IST DER WICHTIGE PUNKT:
+                        if (playAudio) playTone(freq, 'guitar', now + (stringIndex * 0.04));
+                        
                         playedNotesInfo.push({ note: noteName, freq: freq, octave: octave });
                         currentVizNotes.push({ note: noteName, octave: octave });
                     }
                 });
 
             } else {
-                // --- PIANO LOGIK (ROBUST) ---
+                // ... Piano Logik ...
                 const intervals = isJazz ? modeData.jazz.ivs : modeData.pop.ivs;
                 const c4Midi = 60;
-                
-                // Sicherstellen, dass rootDistFromC existiert
                 let rootDistFromC = noteIndexMap[absRootName]; 
                 if (typeof rootDistFromC === 'undefined') rootDistFromC = 0;
 
@@ -1202,15 +1204,15 @@
                     const noteName = notes[noteIndex];
                     const octave = Math.floor(midiPitch / 12) - 1;
 
-                    playTone(freq, 'piano', now + (i * 0.02));
+                    // <--- HIER IST DER WICHTIGE PUNKT:
+                    if (playAudio) playTone(freq, 'piano', now + (i * 0.02));
                     
-                    // Daten speichern für Visualisierung
-                    const noteObj = { note: noteName, freq: freq, octave: octave };
-                    playedNotesInfo.push(noteObj);
+                    playedNotesInfo.push({ note: noteName, freq: freq, octave: octave });
                     currentVizNotes.push({ note: noteName, octave: octave });
                 });
             }
             
+            // Visualisierung läuft IMMER (auch ohne Audio)
             lastPlayedNotes = playedNotesInfo;
             drawNotation(playedNotesInfo);
             updateInstrumentDisplay();
@@ -1891,24 +1893,41 @@
             return tonic;
         }
 
-        function applyDetectedKeyToWheelDebounced(tonicRaw, mode, conf) {
+        function applyDetectedKeyToWheelDebounced(tonicRaw, modeRaw, conf) {
             const tonic = normalizeTonicForUI(tonicRaw);
+            
+            // Backend sendet oft "minor" oder "m". Alles andere ist Dur.
+            const isMinor = (modeRaw === "min" || modeRaw === "m");
 
-            // basic confidence gate (avoid jitter early)
+            // Basic Confidence Gate
             if (typeof conf === "number" && conf < 0.55) return;
 
-            if (tonic === liveState.lastKeyTonic && mode === liveState.lastKeyMode) {
+            // Debounce Logik (Zählen, ob der Key stabil bleibt)
+            if (liveState.lastKeyTonic === tonic && liveState.lastKeyMode === modeRaw) {
                 liveState.sameKeyCount += 1;
             } else {
                 liveState.lastKeyTonic = tonic;
-                liveState.lastKeyMode = mode;
+                liveState.lastKeyMode = modeRaw;
                 liveState.sameKeyCount = 1;
             }
 
-            // Require 2 consecutive confirmations before turning wheel
-            if (liveState.sameKeyCount < 2) return;
+            // Erst wenn 2x hintereinander der gleiche Key kommt, führen wir es aus
+            if (liveState.sameKeyCount >= 2) {
+                
+                // --- HIER IST DIE NEUE LOGIK FÜR DEN MOLL-WECHSEL ---
+                
+                // Prüfen: Steht der Schalter falsch?
+                if (tonalityToggle.checked !== isMinor) {
+                    // 1. Schalter umlegen
+                    tonalityToggle.checked = isMinor;
+                    
+                    // 2. UI sofort aktualisieren (Farben, Symbole, Akkordbezeichnungen)
+                    updateUI(); 
+                }
+                // ----------------------------------------------------
 
-            applyDetectedKeyToWheel(tonic);
+                applyDetectedKeyToWheel(tonic);
+            }
         }
 
         function applyDetectedKeyToWheel(targetNote) {
@@ -1931,48 +1950,67 @@
         }
         function highlightLiveChord(chordStr) {
             // 1. Alle alten Highlights entfernen
-            segmentGroups.forEach(g => g.group.classList.remove('active'));
+            if (typeof segmentGroups !== 'undefined') {
+                segmentGroups.forEach(g => g.group.classList.remove('active'));
+            }
 
             if (!chordStr || chordStr === "--") return;
 
-            // 2. Grundton isolieren (z.B. "Am7" -> "A", "F#dim" -> "F#")
-            // Wir schneiden alles ab, was kein Note-Charakter ist
-            let rootRaw = chordStr.replace(/m.*/, '')
-                                  .replace(/dim.*/, '')
-                                  .replace(/sus.*/, '')
-                                  .replace(/aug.*/, '')
-                                  .replace(/6.*/, '')
-                                  .replace(/7.*/, '')
-                                  .replace(/9.*/, '')
-                                  .replace(/maj.*/, '')
-                                  .replace(/\/.*/, ''); // Slash-Chords (C/G -> C)
+            // 2. Grundton isolieren (FIXED ORDER)
+            let rootRaw = chordStr;
+
+            // WICHTIG: Zuerst lange Suffixe entfernen, die ein 'm' enthalten könnten!
+            // 'dim' muss VOR 'm' entfernt werden, sonst wird aus "Bdim" -> "Bdi" (falsch)
+            rootRaw = rootRaw.replace(/dim.*/i, '')   // "Bdim" -> "B"
+                             .replace(/m7b5.*/i, '')  // "Bm7b5" -> "B"
+                             .replace(/maj.*/i, '')   // "Cmaj7" -> "C"
+                             .replace(/sus.*/i, '')
+                             .replace(/aug.*/i, '')
+                             .replace(/°.*/, '');     // Falls "°" kommt
+
+            // Jetzt erst das einfache Moll-m entfernen (oder m7, m9)
+            // Wir entfernen 'm' gefolgt von Zahlen oder am Ende des Strings
+            rootRaw = rootRaw.replace(/m[0-9].*/, '') // "Am7" -> "A"
+                             .replace(/m$/, '');      // "Am" -> "A"
+
+            // Reste aufräumen (Slash-Chords, Zahlen, Leerzeichen)
+            rootRaw = rootRaw.replace(/\/.*/, '')     // "C/G" -> "C"
+                             .replace(/[0-9].*/, '')  // "C7" -> "C"
+                             .trim();
             
-            rootRaw = rootRaw.trim();
+            // 3. Normalisierung (Englisch -> Deutsch & Enharmonisch)
+            let root = rootRaw;
             
-            // 3. Normalisierung (Englisch/Deutsch & Enharmonisch)
-            let root = normalizeTonicForUI(rootRaw);
-            
-            // Sonderfall: Backend sendet oft "Bb", wir nutzen "A#"
             if (root === "Bb") root = "A#";
-            if (root === "Eb") root = "D#";
-            if (root === "Ab") root = "G#";
-            if (root === "Db") root = "C#";
-            if (root === "Gb") root = "F#";
+            else if (root === "Eb") root = "D#";
+            else if (root === "Ab") root = "G#";
+            else if (root === "Db") root = "C#";
+            else if (root === "Gb") root = "F#";
+            
+            // Backend sendet "B" für H -> Wir brauchen H
+            else if (root === "B") root = "H"; 
 
             // 4. Index finden (0-11)
             const detectedIndex = notes.indexOf(root);
-            if (detectedIndex === -1) return;
+            
+            // Falls Note nicht gefunden (z.B. "Bdi" Fehler von vorher), abbrechen
+            if (detectedIndex === -1) {
+                // console.log("Note nicht erkannt:", rootRaw, "->", root); // Zum Debuggen
+                return;
+            }
 
-            // 5. Relativen Index berechnen (Magie!)
-            // Wenn das Rad gedreht ist (currentStep), müssen wir das einrechnen.
-            // Formel: (NotenIndex + Rotation) % 12
+            // 5. Relativen Index berechnen
             const targetGroupIndex = safeMod(detectedIndex + currentStep, 12);
 
             // 6. Das passende Segment suchen und beleuchten
             const targetRef = segmentGroups.find(r => r.data.index === targetGroupIndex);
             
             if (targetRef) {
+                // A) Visuelles Highlight im Rad
                 targetRef.group.classList.add('active');
+                
+                // B) Noten und Instrument anzeigen (Stumm!)
+                playChordFromPosition(targetRef.data, false);
             }
         }
     </script>
